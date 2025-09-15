@@ -8,10 +8,8 @@ from torch.nn import functional as F
 # from resnet import KeyQueryNetwork
 from core.resnet import ResNetFPN, ResNet_Deeplab
 from core.projection import KeyQueryProjection
-
 from core.competition import Competition
 from core.utils.connected_component import label_connected_component
-from core.utils.segmentation_metrics import measure_static_segmentation_metric
 import core.utils.utils as utils
 import matplotlib.pyplot as plt
 from core.propagation import GraphPropagation
@@ -65,7 +63,7 @@ class EISEN(nn.Module):
         self.register_buffer("pixel_mean", torch.Tensor([123.675, 116.28, 103.53]).view(1, -1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor([58.395, 57.12, 57.375]).view(1, -1, 1, 1), False)
 
-    def forward(self, input, segment_target, get_segments=False, vis_segments=False):
+    def forward(self, input, segment_target, get_segments=False):
         # [Normalize inputs]
         img = (input['img1'] - self.pixel_mean) / self.pixel_std
 
@@ -98,27 +96,20 @@ class EISEN(nn.Module):
             ) * (C ** -0.5)
             affinity_list.append(affinity_logits)
 
-            # [Compute affinity loss]
-            loss = self.compute_loss(affinity_logits, sample_inds, segment_target, [H//stride, W//stride])
-            loss_list.append(loss.unsqueeze(0))
-
-        loss = sum(loss_list)
 
         # [Compute segmentation masks]
         if get_segments:
             # Compute segments via propagation and competition
-            segments = self.compute_segments(affinity_list[0], sample_inds)
-            # Compute segment metrics
-            gt_segment = input['gt_segment']
-            seg_metric, seg_out = self.measure_segments(segments,  gt_segment)
-            seg_metric = {k: v.to(loss.device).unsqueeze(0) for k, v in seg_metric.items()} 
+            centroids = input.get('centroids', None)
+            if centroids is not None:
+                segments, centroid_masks = self.compute_segments(affinity_list[0], sample_inds, centroids) # centroid_masks[0, i] is the segment mask for centroids[i]
+            else:
+                segments = self.compute_segments(affinity_list[0], sample_inds)
+                centroid_masks = None
 
-            if vis_segments:
-                self.visualize_segments(seg_out['pred_segment'], input)
-
-            return affinity_list, loss, seg_metric, None
+            return affinity_list, None, None, None, centroid_masks
         else:
-            return affinity_list, loss, None, None
+            return affinity_list, None, None, None, None
 
 
     def generate_affinity_sample_indices(self, size):
@@ -190,7 +181,7 @@ class EISEN(nn.Module):
 
         return loss
 
-    def compute_segments(self, logits, sample_inds, hidden_dim=32, run_cc=True, min_cc_area=20):
+    def compute_segments(self, logits, sample_inds, centroids=None, hidden_dim=32, run_cc=True, min_cc_area=20):
         B, N, K = logits.shape
 
         # [Initialize hidden states]
@@ -217,34 +208,35 @@ class EISEN(nn.Module):
                          for i in range(B)] #[[1, H, W]]
             segments = torch.cat(cc_labels)
 
+        if centroids is not None:
+            centroid_segments = self.extract_centroid_segments(segments, centroids)
+            return segments, centroid_segments
+
         return segments
 
-    def measure_segments(self, pred_segment, gt_segment):
-        return measure_static_segmentation_metric({'pred_segment': pred_segment}, {'gt_segment': gt_segment},
-                                                  pred_segment.shape[-2:],
-                                                  segment_key=['pred_segment'],
-                                                  eval_full_res=True)
+    def extract_centroid_segments(self, segments, centroids):
+        B, H, W = segments.shape  # H=128, W=128
+        num_centroids = centroids.shape[1]
 
-    def visualize_segments(self, seg_out, input):
-        num_objects = len(seg_out[0][0])
-        pred_obj_seg, gt_obj_seg, iou = seg_out
-        fig, axs = plt.subplots(2, 1 + num_objects, figsize=(10, 4))
-        axs[0, 0].imshow(input['img1'][0].permute(1, 2, 0).cpu())
-        axs[0, 0].set_title('Input image', fontsize=10)
-        axs[1, 0].imshow(input['gt_segment'][0].cpu())
-        axs[1, 0].set_title('GT segments', fontsize=10)
+        # scale centroids from 512x512 to 128x128 space
+        centroids_scaled = centroids.clone().float()  * W / 512 # [num_centroids, 2]
+        centroids_scaled = centroids_scaled.long()[0]
 
-        for n in range(num_objects):
-            axs[0, n + 1].imshow(pred_obj_seg[0][n])
-            axs[0, n + 1].set_title(f'Pred. segment {n}', fontsize=10)
-            axs[1, n + 1].imshow(gt_obj_seg[0][n])
-            axs[1, n + 1].set_title(f'GT segment {n}', fontsize=10)
+        centroid_masks = []
 
-        for i in range(axs.shape[-1]):
-            axs[0, i].set_axis_off()
-            axs[1, i].set_axis_off()
-        plt.show()
-        plt.close()
+        for b in range(B):
+            batch_masks = []
+            for c in range(num_centroids):
+                cx, cy = centroids_scaled[c, 0].item(), centroids_scaled[c, 1].item()
+
+                segment_id = segments[b, cy, cx].item()
+                mask = (segments[b] == segment_id).float()
+                batch_masks.append(mask)
+
+            centroid_masks.append(torch.stack(batch_masks, dim=0))  # [num_centroids, H, W]
+
+        return torch.stack(centroid_masks, dim=0)  # [B, num_centroids, H, W]
+
 
 
 if __name__ == "__main__":

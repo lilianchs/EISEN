@@ -12,6 +12,9 @@ from torchvision.io import read_image
 import matplotlib.pyplot as plt
 import shutil
 import logging
+import logging
+import h5py as h5
+import torch.nn.functional as F
 
 class PlayroomDataset(Dataset):
     def __init__(self, training, args, frame_idx=0, dataset_dir = './datasets/Playroom'):
@@ -90,11 +93,41 @@ class PlayroomDataset(Dataset):
 
         return segment_map
 
+class SpelkeBench(Dataset):
+    def __init__(self, args, frame_idx=0, dataset_path = './datasets/SpelkeBench/550_openx_entity_dataset.h5'):
+        self.frame_idx = frame_idx
+        self.args = args
+        self.dataset = h5.File(dataset_path, 'r')
+        self.file_list = list(self.dataset.keys())
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_name = self.file_list[idx]
+        rgb = self.dataset[file_name]['rgb'][:]
+        img1 = torch.tensor(self.dataset[file_name]['rgb'][:]).permute(2, 0, 1).float()  # [C, H, W]
+        img1 = F.interpolate(img1.unsqueeze(0),size=(512, 512),mode='area').squeeze(0)
+        img2 = img1.clone()
+
+        centroids = torch.tensor(self.dataset[file_name]['centroid'][:])  # [N, 2] (x, y)
+        centroids = centroids * 2 # scale up for 512x512
+
+        gt_segment = self.dataset[file_name]['segment'][:]
+        ret = {'img1': img1, 'rgb': rgb, 'gt_segment': gt_segment, 'centroids': centroids, 'file_name': file_name}
+
+        # use GT segment; unfair but see how it does...
+        ret['segment_target'] = gt_segment
+
+        return ret
+
 
 def fetch_dataloader(args, training=True, drop_last=True):
     """ Create the data loader for the corresponding trainign set """
     if args.dataset == 'playroom':
         dataset = PlayroomDataset(training=training, args=args)
+    elif args.dataset == 'spelkebench':
+        dataset = SpelkeBench(args=args)
     else:
         raise ValueError(f'Expect dataset in [playroom], but got {args.dataset} instead')
 
